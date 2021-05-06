@@ -39,7 +39,7 @@ impl Aggregator {
     }
 
     pub fn add_timeout(&mut self, timeout: Timeout) -> ConsensusResult<Option<TC>> {
-        // TODO: A bad node may make us run out of memory by sending many timeouts
+        // TODO [issue #7]: A bad node may make us run out of memory by sending many timeouts
         // with different round numbers.
 
         // Add the new timeout to our aggregator and see if we have a TC.
@@ -85,8 +85,11 @@ impl QCMaker {
         if self.weight >= committee.quorum_threshold() {
             self.weight = 0; // Ensures QC is only made once.
             return Ok(Some(QC {
-                hash: vote.hash.clone(),
+                id: vote.id.clone(),
                 round: vote.round,
+                parent_id: vote.parent_qc.id.clone(),
+                parent_round: vote.parent_qc.round,
+                next_leader: vote.next_leader,
                 votes: self.votes.clone(),
             }));
         }

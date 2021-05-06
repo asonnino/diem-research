@@ -95,12 +95,11 @@ impl Core {
         self.store.write(key, value).await;
     }
 
-    // -- Start Safety Module --
     fn increase_last_voted_round(&mut self, target: RoundNumber) {
         self.last_voted_round = max(self.last_voted_round, target);
     }
 
-    async fn make_vote(&mut self, block: &Block) -> Option<Vote> {
+    async fn make_vote(&mut self, block: &Block) -> ConsensusResult<Option<Vote>> {
         // Check if we can vote for this block.
         let safety_rule_1 = block.round > self.last_voted_round;
         let mut safety_rule_2 = block.qc.round + 1 == block.round;
@@ -110,24 +109,44 @@ impl Core {
             safety_rule_2 |= can_extend;
         }
         if !(safety_rule_1 && safety_rule_2) {
-            return None;
+            return Ok(None);
         }
 
         // Ensure we won't vote for contradicting blocks.
         self.increase_last_voted_round(block.round);
-        // TODO [issue #15]: Write to storage preferred_round and last_voted_round.
-        Some(Vote::new(&block, self.name, self.signature_service.clone()).await)
-    }
-    // -- End Safety Module --
 
-    // -- Start Pacemaker --
-    fn update_high_qc(&mut self, qc: &QC) {
-        if qc.round > self.high_qc.round {
-            self.high_qc = qc.clone();
+        // TODO [issue #15]: Write to storage last_voted_round.
+
+        let next_leader = self
+            .leader_elector
+            .elect_future_leader(&block.qc, block.round)
+            .await?;
+        Ok(Some(
+            Vote::new(
+                &block,
+                next_leader,
+                self.name,
+                self.signature_service.clone(),
+            )
+            .await,
+        ))
+    }
+
+    #[async_recursion]
+    async fn advance_round(&mut self, round: RoundNumber) {
+        if round < self.round {
+            return;
         }
+        // Reset the timer and advance round.
+        self.timer.reset();
+        self.round = round + 1;
+        debug!("Moved to round {}", self.round);
+
+        // Cleanup the vote aggregator.
+        self.aggregator.cleanup(&self.round);
     }
 
-    async fn local_timeout_round(&mut self) -> ConsensusResult<()> {
+    async fn local_timeout(&mut self) -> ConsensusResult<()> {
         warn!("Timeout reached for round {}", self.round);
         self.increase_last_voted_round(self.round);
         let timeout = Timeout::new(
@@ -161,6 +180,9 @@ impl Core {
         // Ensure the vote is well formed.
         vote.verify(&self.committee)?;
 
+        // Ensure the vote is meant for us (ie. we are the next leader).
+        self.leader_elector.check_vote(vote, self.name)?;
+
         // Add the new vote to our aggregator and see if we have a quorum.
         if let Some(qc) = self.aggregator.add_vote(vote.clone())? {
             debug!("Assembled {:?}", qc);
@@ -168,10 +190,8 @@ impl Core {
             // Process the QC.
             self.process_qc(&qc).await;
 
-            // Make a new block if we are the next leader.
-            if self.name == self.leader_elector.get_leader(self.round) {
-                self.generate_proposal(None).await?;
-            }
+            // Make a new block.
+            self.generate_proposal(None).await?;
         }
         Ok(())
     }
@@ -207,27 +227,12 @@ impl Core {
             .await?;
 
             // Make a new block if we are the next leader.
-            if self.name == self.leader_elector.get_leader(self.round) {
+            if self.name == self.leader_elector.next_leader(&self.high_qc, self.round) {
                 self.generate_proposal(Some(tc)).await?;
             }
         }
         Ok(())
     }
-
-    #[async_recursion]
-    async fn advance_round(&mut self, round: RoundNumber) {
-        if round < self.round {
-            return;
-        }
-        // Reset the timer and advance round.
-        self.timer.reset();
-        self.round = round + 1;
-        debug!("Moved to round {}", self.round);
-
-        // Cleanup the vote aggregator.
-        self.aggregator.cleanup(&self.round);
-    }
-    // -- End Pacemaker --
 
     #[async_recursion]
     async fn generate_proposal(&mut self, tc: Option<TC>) -> ConsensusResult<()> {
@@ -274,8 +279,13 @@ impl Core {
     }
 
     async fn process_qc(&mut self, qc: &QC) {
+        // Try to advance round.
         self.advance_round(qc.round).await;
-        self.update_high_qc(qc);
+
+        // Update high QC.
+        if qc.round > self.high_qc.round {
+            self.high_qc = qc.clone();
+        }
     }
 
     #[async_recursion]
@@ -294,6 +304,9 @@ impl Core {
                 return Ok(());
             }
         };
+
+        // Ensure the block proposer is the right leader for the round.
+        self.leader_elector.check_block(block, &b1)?;
 
         // Store the block only if we have already processed all its ancestors.
         self.store_block(block).await;
@@ -316,7 +329,8 @@ impl Core {
             }
         }
 
-        // Cleanup the mempool.
+        // Optimistically cleanup the mempool. This may result in some transactions
+        // loss: the client will have to resubmit them.
         self.mempool_driver.cleanup(&b0, &b1, &block).await;
 
         // Ensure the block's round is as expected.
@@ -327,9 +341,9 @@ impl Core {
         }
 
         // See if we can vote for this block.
-        if let Some(vote) = self.make_vote(block).await {
+        if let Some(vote) = self.make_vote(block).await? {
             debug!("Created {:?}", vote);
-            let next_leader = self.leader_elector.get_leader(self.round + 1);
+            let next_leader = self.leader_elector.next_leader(&block.qc, block.round);
             if next_leader == self.name {
                 self.handle_vote(&vote).await?;
             } else {
@@ -348,18 +362,6 @@ impl Core {
     }
 
     async fn handle_proposal(&mut self, block: &Block) -> ConsensusResult<()> {
-        let digest = block.digest();
-
-        // Ensure the block proposer is the right leader for the round.
-        ensure!(
-            block.author == self.leader_elector.get_leader(block.round),
-            ConsensusError::WrongLeader {
-                digest,
-                leader: block.author,
-                round: block.round
-            }
-        );
-
         // Check the block is correctly formed.
         block.verify(&self.committee)?;
 
@@ -374,11 +376,14 @@ impl Core {
         // Let's see if we have the block's data. If we don't, the mempool
         // will get it and then make us resume processing this block.
         if !self.mempool_driver.verify(block.clone()).await? {
-            debug!("Processing of {} suspended: missing payload", digest);
+            debug!(
+                "Processing of {} suspended: missing payload",
+                block.digest()
+            );
             return Ok(());
         }
 
-        // All check pass, we can process this block.
+        // Process this block.
         self.process_block(block).await
     }
 
@@ -403,8 +408,16 @@ impl Core {
     }
 
     async fn handle_tc(&mut self, tc: TC) -> ConsensusResult<()> {
+        debug!("Processing {:?}", tc);
+        if tc.round < self.round {
+            return Ok(());
+        }
+
+        // Try to advance round.
         self.advance_round(tc.round).await;
-        if self.name == self.leader_elector.get_leader(self.round) {
+
+        // Propose a block if we are the leader.
+        if self.name == self.leader_elector.next_leader(&self.high_qc, self.round) {
             self.generate_proposal(Some(tc)).await?;
         }
         Ok(())
@@ -414,7 +427,7 @@ impl Core {
         // Upon booting, generate the very first block (if we are the leader).
         // Also, schedule a timer in case we don't hear from the leader.
         self.timer.reset();
-        if self.name == self.leader_elector.get_leader(self.round) {
+        if self.name == self.leader_elector.next_leader(&self.high_qc, self.round) {
             self.generate_proposal(None)
                 .await
                 .expect("Failed to send the first block");
@@ -434,7 +447,7 @@ impl Core {
                         ConsensusMessage::SyncRequest(digest, sender) => self.handle_sync_request(digest, sender).await
                     }
                 },
-                () = &mut self.timer => self.local_timeout_round().await,
+                () = &mut self.timer => self.local_timeout().await,
                 else => break,
             };
             match result {
